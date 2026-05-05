@@ -7,8 +7,22 @@ from config import (
     INTERVAL_MAP,
     DEFAULT_INTERVAL,
     AVAILABILITY_LIMITS,
-    FETCH_LIMITS
+    FETCH_LIMITS,
 )
+
+
+class TsStr(str):
+    """
+    Timestamp string with a convenience method:
+    TsStr("1724457600").ts_to_dt()
+    """
+
+    def ts_to_dt(self):
+        ts = int(self)
+
+        tz = pytz.timezone(TIMEZONE)
+        dt = datetime.fromtimestamp(ts, tz=tz)
+        return dt.strftime(DATETIME_FORMAT)
 
 
 class ReqsHandler:
@@ -16,21 +30,18 @@ class ReqsHandler:
     Handles:
     - datetime parsing
     - normalization
-    - interval alignment
-    - timestamp conversion
     - availability validation
     - chunk decision
+    - chunk planning
     """
 
     def __init__(self, interval=None, timezone=None, dt_format=None):
-
         self.interval = interval or DEFAULT_INTERVAL
 
         if self.interval not in INTERVAL_MAP:
             raise ValueError(f"Invalid interval: {self.interval}")
 
         self.interval_seconds = INTERVAL_MAP[self.interval]
-
         self.format = dt_format or DATETIME_FORMAT
         self.timezone = pytz.timezone(timezone or TIMEZONE)
 
@@ -39,56 +50,79 @@ class ReqsHandler:
     # --------------------------------------------------
     def normalize(self, start_str: str, end_str: str):
         """
-        Converts input → normalized timestamps
+        Returns normalized timestamp strings:
+        {
+            "start_ts": TsStr(...),
+            "end_ts": TsStr(...)
+        }
         """
 
         start = self._parse_datetime(start_str)
-        end   = self._parse_datetime(end_str)
+        end = self._parse_datetime(end_str)
 
         now = self._now()
 
-        # clamp future
+        # Clamp future end to now
         if end > now:
             end = now
 
-        # align to interval
+        # Floor to last completed candle
         start = self._floor_to_interval(start)
-        end   = self._floor_to_interval(end)
+        end = self._floor_to_interval(end)
 
         if start >= end:
             raise ValueError("Invalid range after alignment")
 
-        return int(start.timestamp()), int(end.timestamp())
+        return {
+            "start_ts": TsStr(str(int(start.timestamp()))),
+            "end_ts": TsStr(str(int(end.timestamp()))),
+        }
 
     # --------------------------------------------------
     # AVAILABILITY VALIDATION
     # --------------------------------------------------
     def validate_range(self, start_ts, end_ts):
         """
-        Ensures requested data exists
+        Raises error if requested start is older than available history.
         """
+        start_ts = self._to_int(start_ts)
+        end_ts = self._to_int(end_ts)
 
-        availability = AVAILABILITY_LIMITS[self.interval]
+        rule = AVAILABILITY_LIMITS[self.interval]
 
-        if availability is None:
-            return  # unlimited
+        if rule is None:
+            return
 
-        now_ts = int(self._now().timestamp())
-        min_allowed = now_ts - availability
+        now = self._now()
+        now_ts = int(now.timestamp())
 
-        if start_ts < min_allowed:
+        if isinstance(rule, int):
+            min_allowed_ts = now_ts - rule
+        else:
+            # Example: {"since_year": 2020}
+            since_year = int(rule["since_year"])
+            min_allowed_dt = self.timezone.localize(
+                datetime(since_year, 1, 1, 0, 0, 0)
+            )
+            min_allowed_ts = int(min_allowed_dt.timestamp())
+
+        if start_ts < min_allowed_ts:
             raise ValueError(
-                f"Data not available for interval {self.interval}. "
-                f"Max lookback exceeded."
+                f"Requested range exceeds available history for interval {self.interval}"
             )
 
+        if end_ts <= start_ts:
+            raise ValueError("Invalid range: end must be greater than start")
+
     # --------------------------------------------------
-    # CHUNK DECISION
+    # CHUNK NEED DECISION
     # --------------------------------------------------
     def needs_chunking(self, start_ts, end_ts):
         """
-        Determines if request exceeds API fetch limits
+        Returns True if request exceeds per-request fetch limit.
         """
+        start_ts = self._to_int(start_ts)
+        end_ts = self._to_int(end_ts)
 
         limit = FETCH_LIMITS[self.interval]
 
@@ -98,17 +132,72 @@ class ReqsHandler:
         return (end_ts - start_ts) > limit
 
     # --------------------------------------------------
-    # PARSING
+    # CHUNK PLANNER
+    # --------------------------------------------------
+    def chunk_planner(self, start_ts, end_ts):
+        """
+        Returns:
+        {
+            "needs_chunking": bool,
+            "chunk_count": int,
+            "chunks": [
+                {"start_ts": TsStr(...), "end_ts": TsStr(...)},
+                ...
+            ]
+        }
+        """
+        start_ts = self._to_int(start_ts)
+        end_ts = self._to_int(end_ts)
+
+        self.validate_range(start_ts, end_ts)
+
+        limit = FETCH_LIMITS[self.interval]
+
+        # No chunking needed
+        if limit is None or (end_ts - start_ts) <= limit:
+            return {
+                "needs_chunking": False,
+                "chunk_count": 1,
+                "chunks": [
+                    {
+                        "start_ts": TsStr(str(start_ts)),
+                        "end_ts": TsStr(str(end_ts)),
+                    }
+                ],
+            }
+
+        # Chunking needed
+        chunks = []
+        current = start_ts
+
+        while current < end_ts:
+            next_end = min(current + limit, end_ts)
+
+            chunks.append(
+                {
+                    "start_ts": TsStr(str(current)),
+                    "end_ts": TsStr(str(next_end)),
+                }
+            )
+
+            current = next_end
+
+        return {
+            "needs_chunking": True,
+            "chunk_count": len(chunks),
+            "chunks": chunks,
+        }
+
+    # --------------------------------------------------
+    # INTERNAL HELPERS
     # --------------------------------------------------
     def _parse_datetime(self, dt_str: str):
         dt_str = dt_str.strip()
 
         try:
             dt = datetime.strptime(dt_str, self.format)
-        except:
-            raise ValueError(
-                f"Invalid format. Expected {self.format}"
-            )
+        except Exception:
+            raise ValueError(f"Invalid format. Expected {self.format}")
 
         if dt.tzinfo is None:
             dt = self.timezone.localize(dt)
@@ -117,9 +206,6 @@ class ReqsHandler:
 
         return dt
 
-    # --------------------------------------------------
-    # TIME HELPERS
-    # --------------------------------------------------
     def _now(self):
         return datetime.now(self.timezone)
 
@@ -128,21 +214,30 @@ class ReqsHandler:
         floored = epoch - (epoch % self.interval_seconds)
         return datetime.fromtimestamp(floored, tz=self.timezone)
 
+    def _to_int(self, value):
+        if isinstance(value, TsStr):
+            return int(value)
+        if isinstance(value, str):
+            return int(value)
+        return int(value)
+
+#--------------------------------------------------
+#------------Usage Example-------------------------
 if __name__ == "__main__":
-    handler = ReqsHandler()
+    handler = ReqsHandler(interval="5m")
 
-    start_str = "2026-01-01 00:00:00"
-    end_str   = "2026-01-16 01:00:00"
+    start_dt = "2026-01-01 00:00:00"
+    end_dt = "2026-04-04 00:00:00"
 
-    start_ts, end_ts = handler.normalize(start_str, end_str)
+    # Example usage
+    normalized = handler.normalize(start_dt, end_dt)
+    print("Normalized:", normalized)
 
-    print("Normalized Timestamps:", start_ts, end_ts)
-
-    handler.validate_range(start_ts, end_ts)
-
+    handler.validate_range(normalized["start_ts"], normalized["end_ts"])
     print("Range is valid")
 
-    if handler.needs_chunking(start_ts, end_ts):
-        print("Request needs chunking")
-    else:
-        print("Request can be fetched in one go")
+    needs_chunking = handler.needs_chunking(normalized["start_ts"], normalized["end_ts"])
+    print("Needs chunking:", needs_chunking)
+
+    chunk_plan = handler.chunk_planner(normalized["start_ts"], normalized["end_ts"])
+    print("Chunk plan:", chunk_plan)
