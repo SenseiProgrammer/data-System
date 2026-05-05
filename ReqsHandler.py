@@ -1,4 +1,6 @@
 from datetime import datetime
+import os
+import csv
 import pytz
 
 from config import (
@@ -187,6 +189,100 @@ class ReqsHandler:
             "chunk_count": len(chunks),
             "chunks": chunks,
         }
+    
+    # --------------------------------------------------
+    # CSV FILE CHECK
+    # --------------------------------------------------
+    def is_csv(self, exchange: str, stock: str, interval: str):
+        base_dir = os.getcwd()
+        dir_path = os.path.join(base_dir, "historical", exchange, stock)
+        file_name = f"{interval}_data.csv"
+        file_path = os.path.join(dir_path, file_name)
+
+        os.makedirs(dir_path, exist_ok=True)
+
+        # UPDATED HEADERS
+        required_headers = [
+            "timestamp",
+            "datetime",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume"
+        ]
+
+        status = {
+            "path": file_path,
+            "exists": False,
+            "has_headers": False,
+            "has_data": False,
+            "created": False,
+            "recreated": False
+        }
+
+        # ----------------------------
+        # FILE NOT EXISTS → CREATE
+        # ----------------------------
+        if not os.path.isfile(file_path):
+            with open(file_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(required_headers)
+
+            status.update({
+                "has_headers": True,
+                "created": True
+            })
+            return status
+
+        status["exists"] = True
+
+        # ----------------------------
+        # VALIDATE FILE
+        # ----------------------------
+        try:
+            with open(file_path, "r", newline="") as f:
+                reader = csv.reader(f)
+                rows = list(reader)
+
+            if not rows:
+                raise ValueError("Empty file")
+
+            headers = [h.strip().lower() for h in rows[0]]
+
+            if headers != required_headers:
+                raise ValueError("Invalid headers")
+
+            status["has_headers"] = True
+
+            # Check for data rows
+            if len(rows) > 1:
+                for row in rows[1:]:
+                    if any(cell.strip() for cell in row):
+                        status["has_data"] = True
+                        break
+
+        except Exception:
+            # ----------------------------
+            # RECREATE FILE
+            # ----------------------------
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+
+            with open(file_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(required_headers)
+
+            status.update({
+                "has_headers": True,
+                "recreated": True
+            })
+
+            return status
+
+        return status
 
     # --------------------------------------------------
     # INTERNAL HELPERS
@@ -241,3 +337,6 @@ if __name__ == "__main__":
 
     chunk_plan = handler.chunk_planner(normalized["start_ts"], normalized["end_ts"])
     print("Chunk plan:", chunk_plan)
+    
+    csv_status = handler.is_csv("Nse","TCS","5m")
+    print("CSV STATUS : ", csv_status)
